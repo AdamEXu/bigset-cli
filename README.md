@@ -41,3 +41,18 @@ bigset --app-port 4500 --backend-port 4501
 bigset --keychain-port 3502
 bigset --no-convex
 ```
+
+Dataset commands:
+
+```bash
+bigset create "fintech startups in the bay area" --rows 10 --wait --csv demo.csv
+bigset list
+bigset status <datasetId>
+bigset rows <datasetId> --json
+bigset export <datasetId> --csv out.csv
+bigset populate <datasetId>
+bigset stop <datasetId>
+```
+
+Run `bigset` first and finish local setup in the browser before using dataset
+commands.
