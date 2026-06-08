@@ -1,10 +1,10 @@
 {
-  "name": "@tiny-fish/bigset",
-  "version": "0.0.1",
+  "name": "@adamexu/bigset",
+  "version": "0.0.4",
   "description": "BigSet local launcher",
   "type": "module",
   "bin": {
-    "bigset": "./bin/bigset.js"
+    "bigset": "bin/bigset.js"
   },
   "files": [
     "bin",

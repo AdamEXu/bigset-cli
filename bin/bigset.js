@@ -23,26 +23,36 @@ import {
   join,
   resolve,
 } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const DEFAULT_BIGSET_URL =
-  "https://github.com/tinyfish-io/bigset/releases/latest/download/bigset-build.zip";
+const DEFAULT_BIGSET_RELEASE_BASE =
+  "https://github.com/adamexu/bigset/releases/latest/download";
 const CONVEX_RELEASE_API =
   "https://api.github.com/repos/get-convex/convex-backend/releases/latest";
+const NPM_REGISTRY_BASE = "https://registry.npmjs.org";
 const DEFAULT_HOME = join(homedir(), ".bigset");
 const USER_AGENT = "bigset-cli/0.1";
 const CONVEX_INSTANCE_NAME = "bigset-local";
 const KEYCHAIN_SERVICE = "ai.bigset.local-credentials";
 const LOCAL_CREDENTIAL_SERVICES = new Set(["tinyfish", "openrouter"]);
 const MAX_CREDENTIAL_BODY_BYTES = 64 * 1024;
+const UPDATE_CHECK_TIMEOUT_MS = 2_500;
+const LEGACY_NPM_PACKAGE = "@adamexu/bigset";
+const CANONICAL_NPM_PACKAGE = "@tiny-fish/bigset";
+const UPDATE_CHECK_PACKAGES = [CANONICAL_NPM_PACKAGE, LEGACY_NPM_PACKAGE];
+const PACKAGE_JSON_PATH = fileURLToPath(new URL("../package.json", import.meta.url));
 
 function parseArgs(argv) {
   const options = {
-    bigsetUrl: process.env.BIGSET_BUILD_URL || DEFAULT_BIGSET_URL,
+    bigsetUrl: process.env.BIGSET_BUILD_URL,
     convexUrl: process.env.BIGSET_CONVEX_URL,
     home: process.env.BIGSET_HOME || DEFAULT_HOME,
     force: false,
     noConvex: process.env.BIGSET_NO_CONVEX === "1",
+    updateCheck:
+      process.env.BIGSET_NO_UPDATE_CHECK !== "1" &&
+      process.env.BIGSET_SKIP_UPDATE_CHECK !== "1",
     appPort: process.env.BIGSET_FRONTEND_PORT || "3500",
     backendPort: process.env.BIGSET_BACKEND_PORT || "3501",
     convexPort: process.env.BIGSET_CONVEX_PORT || "3210",
@@ -99,11 +109,14 @@ function parseArgs(argv) {
       options.force = true;
     } else if (arg === "--no-convex") {
       options.noConvex = true;
+    } else if (arg === "--no-update-check") {
+      options.updateCheck = false;
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }
   }
 
+  options.bigsetUrl ||= defaultBigSetUrl();
   options.home = resolve(options.home);
   return options;
 }
@@ -115,7 +128,7 @@ Usage:
   bigset [options]
 
 Options:
-  --bigset-url <url|path>    BigSet build zip. Defaults to latest GitHub release.
+  --bigset-url <url|path>    BigSet build zip. Defaults to latest platform release.
   --convex-url <url|path>    Convex backend zip. Defaults to latest GitHub release asset.
   --home <path>              Install/cache directory. Defaults to ~/.bigset.
   --app-port <port>          Frontend port. Defaults to 3500.
@@ -125,11 +138,30 @@ Options:
   --keychain-port <port>     Local credential bridge port. Defaults to any free port.
   --force                   Reinstall BigSet even if the source did not change.
   --no-convex               Skip Convex download/start.
+  --no-update-check         Skip npm package update checks.
   --help                    Show this help.
 
 Environment:
-  BIGSET_BUILD_URL, BIGSET_CONVEX_URL, BIGSET_HOME
+  BIGSET_BUILD_URL, BIGSET_CONVEX_URL, BIGSET_HOME, BIGSET_NO_UPDATE_CHECK
 `);
+}
+
+function bigsetAssetName() {
+  const arch = process.arch;
+  const platform = process.platform;
+
+  if (
+    (platform === "darwin" || platform === "linux" || platform === "win32") &&
+    (arch === "arm64" || arch === "x64")
+  ) {
+    return `bigset-build-${platform}-${arch}.zip`;
+  }
+
+  throw new Error(`No BigSet build mapping for ${platform}/${arch}`);
+}
+
+function defaultBigSetUrl() {
+  return `${DEFAULT_BIGSET_RELEASE_BASE}/${bigsetAssetName()}`;
 }
 
 function displaySource(source) {
@@ -150,6 +182,18 @@ function localPathFromSource(source) {
 
 function hashText(text) {
   return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
+
+function stableRemoteSource(source) {
+  try {
+    const url = new URL(source);
+    if (url.hostname === "release-assets.githubusercontent.com") {
+      url.search = "";
+      url.hash = "";
+      return url.href;
+    }
+  } catch {}
+  return source;
 }
 
 async function sourceSignature(source) {
@@ -174,15 +218,25 @@ async function sourceSignature(source) {
   }
   return {
     kind: "remote",
-    source: response.url || source,
+    source: stableRemoteSource(response.url || source),
     etag: response.headers.get("etag"),
     lastModified: response.headers.get("last-modified"),
     size: Number(response.headers.get("content-length") || 0) || undefined,
   };
 }
 
+function comparableSignature(signature) {
+  if (signature?.kind !== "remote" || typeof signature.source !== "string") {
+    return signature;
+  }
+  return {
+    ...signature,
+    source: stableRemoteSource(signature.source),
+  };
+}
+
 function sameSignature(a, b) {
-  return JSON.stringify(a) === JSON.stringify(b);
+  return JSON.stringify(comparableSignature(a)) === JSON.stringify(comparableSignature(b));
 }
 
 async function readJson(path) {
@@ -190,6 +244,200 @@ async function readJson(path) {
     return JSON.parse(await readFile(path, "utf8"));
   } catch {
     return null;
+  }
+}
+
+async function readCliPackageMetadata() {
+  const packageJson = await readJson(PACKAGE_JSON_PATH);
+  return {
+    name: typeof packageJson?.name === "string" ? packageJson.name : LEGACY_NPM_PACKAGE,
+    version: typeof packageJson?.version === "string" ? packageJson.version : "0.0.0",
+  };
+}
+
+function npmRegistryPackageUrl(packageName) {
+  return `${NPM_REGISTRY_BASE}/${packageName.replace("/", "%2F")}`;
+}
+
+async function fetchNpmPackage(packageName) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), UPDATE_CHECK_TIMEOUT_MS);
+  try {
+    const response = await fetch(npmRegistryPackageUrl(packageName), {
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: "application/vnd.npm.install-v1+json",
+      },
+      signal: controller.signal,
+    });
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      throw new Error(`npm registry returned ${response.status} for ${packageName}`);
+    }
+
+    const packageInfo = await response.json();
+    const latest = packageInfo?.["dist-tags"]?.latest;
+    if (typeof latest !== "string" || !latest) return null;
+    return { name: packageName, latest };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function parseSemver(version) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(version);
+  if (!match) return null;
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: match[4] ? match[4].split(".") : [],
+  };
+}
+
+function comparePrereleaseIdentifier(a, b) {
+  const aNumeric = /^\d+$/.test(a);
+  const bNumeric = /^\d+$/.test(b);
+  if (aNumeric && bNumeric) return Number(a) - Number(b);
+  if (aNumeric) return -1;
+  if (bNumeric) return 1;
+  return a.localeCompare(b);
+}
+
+function comparePrerelease(a, b) {
+  if (a.length === 0 && b.length === 0) return 0;
+  if (a.length === 0) return 1;
+  if (b.length === 0) return -1;
+
+  const length = Math.max(a.length, b.length);
+  for (let i = 0; i < length; i++) {
+    if (a[i] === undefined) return -1;
+    if (b[i] === undefined) return 1;
+    const compared = comparePrereleaseIdentifier(a[i], b[i]);
+    if (compared !== 0) return compared;
+  }
+  return 0;
+}
+
+function compareSemver(a, b) {
+  const parsedA = parseSemver(a);
+  const parsedB = parseSemver(b);
+  if (!parsedA || !parsedB) {
+    return a.localeCompare(b, undefined, { numeric: true });
+  }
+
+  for (const key of ["major", "minor", "patch"]) {
+    const compared = parsedA[key] - parsedB[key];
+    if (compared !== 0) return compared;
+  }
+  return comparePrerelease(parsedA.prerelease, parsedB.prerelease);
+}
+
+function isNewerVersion(candidate, current) {
+  return compareSemver(candidate, current) > 0;
+}
+
+async function resolvePackageUpdateNotice(cliPackage) {
+  const entries = await Promise.all(
+    UPDATE_CHECK_PACKAGES.map(async (packageName) => [
+      packageName,
+      await fetchNpmPackage(packageName).catch(() => null),
+    ]),
+  );
+  const registryPackages = new Map(entries);
+  const canonicalPackage = registryPackages.get(CANONICAL_NPM_PACKAGE);
+
+  if (cliPackage.name !== CANONICAL_NPM_PACKAGE && canonicalPackage?.latest) {
+    return {
+      kind: "migration",
+      currentPackage: cliPackage.name,
+      currentVersion: cliPackage.version,
+      recommendedPackage: CANONICAL_NPM_PACKAGE,
+      recommendedVersion: canonicalPackage.latest,
+    };
+  }
+
+  const currentPackageName = UPDATE_CHECK_PACKAGES.includes(cliPackage.name)
+    ? cliPackage.name
+    : LEGACY_NPM_PACKAGE;
+  const currentRegistryPackage = registryPackages.get(currentPackageName);
+  if (
+    currentRegistryPackage?.latest &&
+    isNewerVersion(currentRegistryPackage.latest, cliPackage.version)
+  ) {
+    return {
+      kind: "update",
+      currentPackage: cliPackage.name,
+      currentVersion: cliPackage.version,
+      recommendedPackage: currentRegistryPackage.name,
+      recommendedVersion: currentRegistryPackage.latest,
+    };
+  }
+
+  return null;
+}
+
+function updateCommandsForNotice(notice) {
+  if (notice.kind === "migration") {
+    const commands = [];
+    if (notice.currentPackage) {
+      commands.push(`npm uninstall -g ${notice.currentPackage}`);
+    }
+    commands.push(`npm install -g ${notice.recommendedPackage}`);
+    return commands;
+  }
+  return [`npm install -g ${notice.recommendedPackage}`];
+}
+
+function printUpdateNotice(notice) {
+  console.warn("");
+  if (notice.kind === "migration") {
+    console.warn("BigSet CLI is now published under TinyFish:");
+  } else {
+    console.warn("A newer BigSet CLI is available:");
+  }
+  console.warn(`  Installed: ${notice.currentPackage} ${notice.currentVersion}`);
+  console.warn(`  Latest:    ${notice.recommendedPackage} ${notice.recommendedVersion}`);
+  console.warn("");
+  console.warn("Recommended update:");
+  for (const command of updateCommandsForNotice(notice)) {
+    console.warn(`  ${command}`);
+  }
+  console.warn("");
+}
+
+async function promptToLaunchOutdated(notice) {
+  printUpdateNotice(notice);
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.warn("No interactive terminal detected; launching the installed version anyway.");
+    console.warn("");
+    return;
+  }
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  let shouldExit = false;
+  try {
+    const answer = await rl.question(
+      `Launch ${notice.currentPackage} ${notice.currentVersion} anyway? [Y/n] `,
+    );
+    shouldExit = /^n(?:o)?$/i.test(answer.trim());
+  } finally {
+    rl.close();
+  }
+
+  if (shouldExit) {
+    console.log("Stopped before launch. Update BigSet with the command above.");
+    process.exit(0);
+  }
+  console.log("");
+}
+
+async function maybePromptForPackageUpdate(options) {
+  if (!options.updateCheck) return;
+  const cliPackage = await readCliPackageMetadata();
+  const notice = await resolvePackageUpdateNotice(cliPackage).catch(() => null);
+  if (notice) {
+    await promptToLaunchOutdated(notice);
   }
 }
 
@@ -283,6 +531,14 @@ function formatBytes(bytes) {
   return `${mb.toFixed(mb >= 10 ? 2 : 2)} MB`;
 }
 
+function formatSignatureDetails(signature) {
+  const details = [];
+  if (signature?.lastModified) details.push(`modified ${signature.lastModified}`);
+  if (signature?.size) details.push(formatBytes(signature.size));
+  if (signature?.etag) details.push(`etag ${signature.etag}`);
+  return details.length > 0 ? ` (${details.join(", ")})` : "";
+}
+
 const progressState = new Map();
 
 function run(command, args, options = {}) {
@@ -329,19 +585,66 @@ async function extractZip(zipPath, destination) {
   run("unzip", ["-q", zipPath, "-d", destination]);
 }
 
+function bigSetCoreSource(state, options) {
+  if (typeof state?.source === "string") return state.source;
+  if (typeof state?.signature?.source === "string") return state.signature.source;
+  return displaySource(options.bigsetUrl);
+}
+
+async function promptToUpdateBigSetCore(state, signature, options) {
+  console.warn("");
+  console.warn("A newer BigSet core is available:");
+  console.warn(
+    `  Installed: ${bigSetCoreSource(state, options)}${formatSignatureDetails(state?.signature)}`,
+  );
+  console.warn(
+    `  Latest:    ${displaySource(options.bigsetUrl)}${formatSignatureDetails(signature)}`,
+  );
+  console.warn("");
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.warn("No interactive terminal detected; launching the installed BigSet core without updating.");
+    console.warn("");
+    return false;
+  }
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await rl.question("Update BigSet core now? [Y/n] ");
+    const shouldUpdate = !/^n(?:o)?$/i.test(answer.trim());
+    if (!shouldUpdate) {
+      console.log("Launching the installed BigSet core without updating.");
+      console.log("");
+    }
+    return shouldUpdate;
+  } finally {
+    rl.close();
+  }
+}
+
 async function installBigSet(options, paths) {
   const statePath = join(paths.bigsetDir, "state.json");
   const state = await readJson(statePath);
   const signature = await sourceSignature(options.bigsetUrl);
+  const hasInstalledBigSet = existsSync(paths.bigsetCurrent);
 
   if (
     !options.force &&
-    existsSync(paths.bigsetCurrent) &&
+    hasInstalledBigSet &&
     state?.signature &&
     sameSignature(state.signature, signature)
   ) {
     console.log(`BigSet is already installed from ${displaySource(options.bigsetUrl)}`);
-    return;
+    return { installed: false, updated: false };
+  }
+
+  if (
+    !options.force &&
+    hasInstalledBigSet &&
+    state?.signature &&
+    !(await promptToUpdateBigSetCore(state, signature, options))
+  ) {
+    return { installed: false, updated: false, skippedUpdate: true };
   }
 
   const downloadName = `bigset-${hashText(JSON.stringify(signature))}.zip`;
@@ -371,6 +674,7 @@ async function installBigSet(options, paths) {
       2,
     ),
   );
+  return { installed: true, updated: hasInstalledBigSet };
 }
 
 function convexAssetName() {
@@ -388,6 +692,12 @@ function convexAssetName() {
   }
   if (platform === "linux" && arch === "x64") {
     return "convex-local-backend-x86_64-unknown-linux-gnu.zip";
+  }
+  if (platform === "win32" && arch === "arm64") {
+    console.warn(
+      "No native Windows arm64 Convex backend is available; using the Windows x64 backend under emulation.",
+    );
+    return "convex-local-backend-x86_64-pc-windows-msvc.zip";
   }
   if (platform === "win32" && arch === "x64") {
     return "convex-local-backend-x86_64-pc-windows-msvc.zip";
@@ -444,13 +754,60 @@ async function findConvexBinary(dir) {
   return null;
 }
 
-async function installConvex(options, paths) {
+function convexInstallDir(paths, resolved) {
+  return join(paths.convexDir, resolved.tag, resolved.assetName.replace(/\.zip$/i, ""));
+}
+
+async function findInstalledConvex(paths) {
+  const state = await readJson(paths.convexStatePath);
+  if (typeof state?.tag === "string" && typeof state?.assetName === "string") {
+    const binary = await findConvexBinary(convexInstallDir(paths, state)).catch(() => null);
+    if (binary) return { ...state, binary };
+  }
+
+  const binary = await findConvexBinary(paths.convexDir).catch(() => null);
+  if (!binary) return null;
+  return {
+    tag: "cached",
+    assetName: basename(dirname(binary)),
+    url: null,
+    binary,
+  };
+}
+
+async function writeConvexState(paths, resolved, binary) {
+  await mkdir(dirname(paths.convexStatePath), { recursive: true });
+  await writeFile(
+    paths.convexStatePath,
+    JSON.stringify(
+      {
+        tag: resolved.tag,
+        assetName: resolved.assetName,
+        url: resolved.url,
+        installedAt: new Date().toISOString(),
+      },
+      null,
+      2,
+    ),
+  );
+  return { ...resolved, binary };
+}
+
+async function installConvex(options, paths, bigSetInstall) {
+  const currentInstall = await findInstalledConvex(paths);
+  const canReuseCurrent =
+    currentInstall && !options.force && !options.convexUrl && !bigSetInstall.installed;
+  if (canReuseCurrent) {
+    console.log(`Convex is already installed (${currentInstall.tag}, ${currentInstall.assetName})`);
+    return currentInstall;
+  }
+
   const resolved = await resolveConvexDownload(options);
-  const installDir = join(paths.convexDir, resolved.tag, resolved.assetName.replace(/\.zip$/i, ""));
+  const installDir = convexInstallDir(paths, resolved);
   const binary = await findConvexBinary(installDir).catch(() => null);
   if (binary && !options.force) {
     console.log(`Convex is already installed (${resolved.tag}, ${resolved.assetName})`);
-    return { ...resolved, binary };
+    return writeConvexState(paths, resolved, binary);
   }
 
   const zipPath = join(paths.downloadsDir, `${resolved.tag}-${resolved.assetName}`);
@@ -465,7 +822,7 @@ async function installConvex(options, paths) {
   if (process.platform !== "win32") {
     await chmod(installedBinary, 0o755);
   }
-  return { ...resolved, binary: installedBinary };
+  return writeConvexState(paths, resolved, installedBinary);
 }
 
 async function ensureConvexSecret(paths) {
@@ -889,19 +1246,21 @@ async function main() {
     bigsetDir: join(options.home, "bigset"),
     bigsetCurrent: join(options.home, "bigset", "current"),
     convexDir: join(options.home, "convex"),
+    convexStatePath: join(options.home, "convex", "state.json"),
     convexDataDir: join(options.home, "data", "convex"),
     convexSecretPath: join(options.home, "data", "convex", "instance-secret"),
     credentialsPath: join(options.home, "data", "credentials.json"),
   };
 
+  await maybePromptForPackageUpdate(options);
   await mkdir(paths.home, { recursive: true });
   console.log("Setting up BigSet...");
   console.log(`Node version: ${process.version}`);
   console.log(`Install dir:   ${paths.home}`);
   console.log("");
 
-  await installBigSet(options, paths);
-  const convexInstall = options.noConvex ? null : await installConvex(options, paths);
+  const bigSetInstall = await installBigSet(options, paths);
+  const convexInstall = options.noConvex ? null : await installConvex(options, paths, bigSetInstall);
   await runBigSet(options, paths, convexInstall);
 }
 

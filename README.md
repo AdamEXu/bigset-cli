@@ -13,16 +13,24 @@ For a one-off run without installing globally:
 npx @tiny-fish/bigset
 ```
 
-By default it downloads the latest BigSet release, downloads the matching
-prebuilt Convex backend from GitHub, deploys BigSet's Convex functions, starts a
-local credential bridge, caches everything under `~/.bigset`, and starts the app
-locally.
+By default it downloads the latest BigSet release for your OS/architecture,
+downloads the matching prebuilt Convex backend from GitHub, deploys BigSet's
+Convex functions, starts a local credential bridge, caches everything under
+`~/.bigset`, and starts the app locally.
+
+On later runs, the launcher checks for CLI package updates and cached BigSet
+core updates. Convex is updated only when BigSet core is installed or updated,
+so deferring a BigSet core update keeps the matching cached Convex binary.
 
 For local testing against a build zip:
 
 ```bash
 node bin/bigset.js --bigset-url file:///absolute/path/to/bigset-build.zip
 ```
+
+Release build assets are named by Node platform and architecture, for example
+`bigset-build-darwin-arm64.zip`, `bigset-build-linux-x64.zip`, or
+`bigset-build-win32-arm64.zip`.
 
 Useful options:
 
