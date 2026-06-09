@@ -7,11 +7,21 @@
     "bigset": "bin/bigset.js"
   },
   "files": [
+    "dist",
     "bin",
     "README.md"
   ],
+  "scripts": {
+    "build": "tsc",
+    "prepack": "npm run build"
+  },
   "dependencies": {
+    "@oclif/core": "^4.2.10",
     "@napi-rs/keyring": "^1.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
   },
   "publishConfig": {
     "access": "public"
